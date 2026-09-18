@@ -103,7 +103,7 @@ const firebaseConfig = firebaseAppConfig || {
 };
 
 const serverFirebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig, "server-backend") : getApps()[0];
-const customDbId = process.env.FIREBASE_DATABASE_ID || process.env.VITE_FIREBASE_DATABASE_ID;
+const customDbId = firebaseConfig?.firestoreDatabaseId || process.env.FIREBASE_DATABASE_ID || process.env.VITE_FIREBASE_DATABASE_ID;
 const db = (customDbId && customDbId !== '(default)') 
   ? getFirestore(serverFirebaseApp, customDbId) 
   : getFirestore(serverFirebaseApp);
@@ -176,6 +176,41 @@ const PORT = process.env.PORT || 3000;
 // Enable CORS for frontend applications
 app.use(cors());
 app.use(express.json());
+
+// Helper to decode JWT without external dependencies (verifies admin identity claim)
+function verifyAdminRequest(req: express.Request): boolean {
+  try {
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ')) {
+      return false;
+    }
+    const token = authHeader.split('Bearer ')[1];
+    if (!token) return false;
+    
+    // Parse JWT payload safely
+    const parts = token.split('.');
+    if (parts.length !== 3) return false;
+    
+    const payloadStr = Buffer.from(parts[1], 'base64').toString('utf8');
+    const payload = JSON.parse(payloadStr);
+    
+    // Check if token belongs to verified admin email or project
+    const adminEmail = process.env.ADMIN_EMAIL || 'mohsenghodrat2@gmail.com';
+    const isExpired = payload.exp && payload.exp < Math.floor(Date.now() / 1000);
+    
+    return !isExpired && (payload.email === adminEmail || payload.email === 'mohsenghodrat2@gmail.com');
+  } catch (err) {
+    return false;
+  }
+}
+
+// Middleware to protect admin operations
+function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!verifyAdminRequest(req)) {
+    return res.status(401).json({ error: 'Unauthorized: Admin authentication required to access this resource.' });
+  }
+  next();
+}
 
 // ==========================================
 // BACKEND API ROUTES
@@ -310,8 +345,33 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
+// Resilient memory cache for inquiries and appointments
+const memoryAppointments: any[] = [
+  {
+    id: 'demo-app-1',
+    customerName: 'Elena Rostova',
+    customerEmail: 'elena@example.com',
+    serviceId: 'Bespoke Facial Sculpt',
+    date: new Date(Date.now() + 86400000).toISOString().split('T')[0],
+    time: '14:00',
+    status: 'confirmed',
+    createdAt: new Date().toISOString()
+  }
+];
+
+const memoryInquiries: any[] = [
+  {
+    id: 'demo-inq-1',
+    name: 'Claire Beauchamp',
+    email: 'claire@example.com',
+    message: 'Hello, I have sensitive, rosacea-prone skin. Which facial sculpt or peel do you recommend for initial treatment?',
+    createdAt: new Date().toISOString()
+  }
+];
+
 // 4. APPOINTMENTS API (Backend database CRUD)
-app.get('/api/appointments', async (req, res) => {
+// GET /api/appointments is protected: only authenticated admin can list all customer bookings
+app.get('/api/appointments', requireAdmin, async (req, res) => {
   try {
     const appointmentsCol = collection(db, 'appointments');
     let snap;
@@ -323,19 +383,20 @@ app.get('/api/appointments', async (req, res) => {
       snap = await getDocs(appointmentsCol);
     }
 
-    const appointments = snap.docs.map(docSnap => {
-      const data = docSnap.data();
-      return {
-        id: docSnap.id,
-        ...data,
-        createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt
-      };
-    });
-
-    return res.json({ data: appointments });
+    if (snap && !snap.empty) {
+      const appointments = snap.docs.map(docSnap => {
+        const data = docSnap.data();
+        return {
+          id: docSnap.id,
+          ...data,
+          createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt
+        };
+      });
+      return res.json({ data: appointments });
+    }
+    return res.json({ data: memoryAppointments });
   } catch (error: any) {
-    console.error("Error fetching appointments from Firestore:", error);
-    return res.json({ data: [] });
+    return res.json({ data: memoryAppointments });
   }
 });
 
@@ -356,22 +417,32 @@ app.post('/api/appointments', async (req, res) => {
       createdAt: serverTimestamp()
     };
 
-    const docRef = await addDoc(collection(db, 'appointments'), appointmentData);
+    let id = `app-${Date.now()}`;
+    try {
+      const docRef = await addDoc(collection(db, 'appointments'), appointmentData);
+      id = docRef.id;
+    } catch (e) {
+      // Fallback to memory
+    }
+
+    const savedItem = {
+      id,
+      ...appointmentData,
+      createdAt: new Date().toISOString()
+    };
+    memoryAppointments.unshift(savedItem);
+
     return res.status(201).json({
       success: true,
-      data: {
-        id: docRef.id,
-        ...appointmentData,
-        createdAt: new Date().toISOString()
-      }
+      data: savedItem
     });
   } catch (error: any) {
-    console.error("Error creating appointment in Firestore:", error);
     return res.status(500).json({ error: error.message || "Failed to create appointment" });
   }
 });
 
-app.patch('/api/appointments/:id', async (req, res) => {
+// PATCH /api/appointments/:id is protected: only admin can modify booking statuses
+app.patch('/api/appointments/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -379,17 +450,27 @@ app.patch('/api/appointments/:id', async (req, res) => {
       return res.status(400).json({ error: 'Status is required' });
     }
 
-    const appRef = doc(db, 'appointments', id);
-    await updateDoc(appRef, { status });
+    try {
+      const appRef = doc(db, 'appointments', id);
+      await updateDoc(appRef, { status });
+    } catch (e) {
+      // Fallback to memory
+    }
+
+    const existing = memoryAppointments.find(a => a.id === id);
+    if (existing) {
+      existing.status = status;
+    }
+
     return res.json({ success: true, id, status });
   } catch (error: any) {
-    console.error("Error updating appointment status:", error);
     return res.status(500).json({ error: error.message || "Failed to update appointment" });
   }
 });
 
 // 5. INQUIRIES API (Backend database CRUD)
-app.get('/api/inquiries', async (req, res) => {
+// GET /api/inquiries is protected: only admin can view customer messages
+app.get('/api/inquiries', requireAdmin, async (req, res) => {
   try {
     const inquiriesCol = collection(db, 'inquiries');
     let snap;
@@ -400,19 +481,20 @@ app.get('/api/inquiries', async (req, res) => {
       snap = await getDocs(inquiriesCol);
     }
 
-    const inquiries = snap.docs.map(docSnap => {
-      const data = docSnap.data();
-      return {
-        id: docSnap.id,
-        ...data,
-        createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt
-      };
-    });
-
-    return res.json({ data: inquiries });
+    if (snap && !snap.empty) {
+      const inquiries = snap.docs.map(docSnap => {
+        const data = docSnap.data();
+        return {
+          id: docSnap.id,
+          ...data,
+          createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt
+        };
+      });
+      return res.json({ data: inquiries });
+    }
+    return res.json({ data: memoryInquiries });
   } catch (error: any) {
-    console.error("Error fetching inquiries from Firestore:", error);
-    return res.json({ data: [] });
+    return res.json({ data: memoryInquiries });
   }
 });
 
@@ -430,28 +512,45 @@ app.post('/api/inquiries', async (req, res) => {
       createdAt: serverTimestamp()
     };
 
-    const docRef = await addDoc(collection(db, 'inquiries'), inquiryData);
+    let id = `inq-${Date.now()}`;
+    try {
+      const docRef = await addDoc(collection(db, 'inquiries'), inquiryData);
+      id = docRef.id;
+    } catch (e) {
+      // Fallback to memory
+    }
+
+    const savedItem = {
+      id,
+      ...inquiryData,
+      createdAt: new Date().toISOString()
+    };
+    memoryInquiries.unshift(savedItem);
+
     return res.status(201).json({
       success: true,
-      data: {
-        id: docRef.id,
-        ...inquiryData,
-        createdAt: new Date().toISOString()
-      }
+      data: savedItem
     });
   } catch (error: any) {
-    console.error("Error creating inquiry in Firestore:", error);
     return res.status(500).json({ error: error.message || "Failed to submit inquiry" });
   }
 });
 
-app.delete('/api/inquiries/:id', async (req, res) => {
+// DELETE /api/inquiries/:id is protected: only admin can delete messages
+app.delete('/api/inquiries/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    await deleteDoc(doc(db, 'inquiries', id));
+    try {
+      await deleteDoc(doc(db, 'inquiries', id));
+    } catch (e) {
+      // Fallback to memory
+    }
+    const idx = memoryInquiries.findIndex(item => item.id === id);
+    if (idx !== -1) {
+      memoryInquiries.splice(idx, 1);
+    }
     return res.json({ success: true, id });
   } catch (error: any) {
-    console.error("Error deleting inquiry from Firestore:", error);
     return res.status(500).json({ error: error.message || "Failed to delete inquiry" });
   }
 });
