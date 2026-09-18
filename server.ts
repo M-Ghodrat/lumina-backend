@@ -177,6 +177,22 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Helper to safely parse JWT base64url payloads
+function parseJwtPayload(token: string): any {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4 !== 0) {
+      b64 += '=';
+    }
+    const jsonStr = Buffer.from(b64, 'base64').toString('utf8');
+    return JSON.parse(jsonStr);
+  } catch {
+    return null;
+  }
+}
+
 // Helper to decode JWT without external dependencies (verifies admin identity claim)
 function verifyAdminRequest(req: express.Request): boolean {
   try {
@@ -184,21 +200,20 @@ function verifyAdminRequest(req: express.Request): boolean {
     if (!authHeader.startsWith('Bearer ')) {
       return false;
     }
-    const token = authHeader.split('Bearer ')[1];
+    const token = authHeader.split('Bearer ')[1]?.trim();
     if (!token) return false;
     
-    // Parse JWT payload safely
-    const parts = token.split('.');
-    if (parts.length !== 3) return false;
-    
-    const payloadStr = Buffer.from(parts[1], 'base64').toString('utf8');
-    const payload = JSON.parse(payloadStr);
+    const payload = parseJwtPayload(token);
+    if (!payload) return false;
     
     // Check if token belongs to verified admin email or project
-    const adminEmail = process.env.ADMIN_EMAIL || 'mohsenghodrat2@gmail.com';
-    const isExpired = payload.exp && payload.exp < Math.floor(Date.now() / 1000);
+    const adminEmail = (process.env.ADMIN_EMAIL || 'mohsenghodrat2@gmail.com').toLowerCase().trim();
+    const userEmail = (payload.email || payload.firebase?.identities?.email?.[0] || '').toLowerCase().trim();
     
-    return !isExpired && (payload.email === adminEmail || payload.email === 'mohsenghodrat2@gmail.com');
+    const nowSec = Math.floor(Date.now() / 1000);
+    const isExpired = payload.exp && payload.exp < (nowSec - 300);
+    
+    return !isExpired && (userEmail === adminEmail || userEmail === 'mohsenghodrat2@gmail.com');
   } catch (err) {
     return false;
   }
@@ -207,7 +222,7 @@ function verifyAdminRequest(req: express.Request): boolean {
 // Middleware to protect admin operations
 function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
   if (!verifyAdminRequest(req)) {
-    return res.status(401).json({ error: 'Unauthorized: Admin authentication required to access this resource.' });
+    return res.status(401).json({ error: 'Unauthorized: Admin authentication required. Please sign in with your admin account (mohsenghodrat2@gmail.com).' });
   }
   next();
 }
