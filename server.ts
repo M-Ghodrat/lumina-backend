@@ -103,7 +103,10 @@ const firebaseConfig = firebaseAppConfig || {
 };
 
 const serverFirebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig, "server-backend") : getApps()[0];
-const db = getFirestore(serverFirebaseApp, firebaseConfig.firestoreDatabaseId || "(default)");
+const customDbId = process.env.FIREBASE_DATABASE_ID || process.env.VITE_FIREBASE_DATABASE_ID;
+const db = (customDbId && customDbId !== '(default)') 
+  ? getFirestore(serverFirebaseApp, customDbId) 
+  : getFirestore(serverFirebaseApp);
 
 // Lazy initialization for Gemini AI client
 let aiClient: GoogleGenAI | null = null;
